@@ -24,10 +24,11 @@
      #INCLUDE <P16F88.INC>          ; processor specific variable definitions
 
 
-     __CONFIG    _CONFIG1, _CP_OFF & _CCP1_RB0 & _DEBUG_OFF & _WRT_PROTECT_OFF & _CPD_OFF & _LVP_OFF & _BODEN_OFF & _MCLR_ON & _PWRTE_ON & _WDT_OFF & _INTRC_IO
+     __CONFIG    _CONFIG1, _CP_OFF & _CCP1_RB0 & _DEBUG_OFF & _WRT_PROTECT_OFF & _CPD_OFF & _LVP_OFF & _BODEN_ON & _MCLR_ON & _PWRTE_ON & _WDT_OFF & _INTRC_IO
      __CONFIG    _CONFIG2, _IESO_OFF & _FCMEN_OFF
 
-
+   ;  !!! config changes needed, _mclr_off
+ 
 ; Available Data Memory divided into Bank 0 through Bank 3.  Each Bank contains
 ; Special Function Registers and General Purpose Registers at the locations 
 ; below:  
@@ -48,6 +49,25 @@
   /* lcd command bit masks on portb */
 #define LCD_CS  0x08
 #define LCD_DC  0x20
+  /* some bits to pass to the dds calculation */
+  /* if NEW is true, then need to do all the calculations, else load the saved base word */
+  /* and add the IF offset for RX or the tx offset for TX */
+#define NEW    1
+#define TX     2
+#define RX     4
+
+#define DDS_LD 0x40
+
+  /* encoder users */
+#define FREQ 0
+#define VOLUME 1
+#define KEY_SPEED 2
+  /* timer 1 */
+#define T1ON  1
+#define T1OFF  0
+#define T1LOW   0x18
+#define T1HIGH  0xfc
+
 
 /* include the SFR's as C chars and the runtime library */
 #include  "p16f88.h"
@@ -55,7 +75,6 @@
 
 /* eeprom   ( uses the extern keyword ) */
 /* extern char EEPROM[2] = {0xff,0xff};  access entire eeprom as an array, or declare other variables */
-extern char fonts[5] = {0x46, 0x49, 0x49, 0x49, 0x31};  /*letter S, row of zeros removed */
 extern char numbers[] = {
  0x3E, 0x51, 0x49, 0x45, 0x3E,  
  0x00, 0x42, 0x7F, 0x40, 0x00,
@@ -107,14 +126,16 @@ char _temp;     /* temp location for subtracts and shifts */
 char _temp2;    /* for interrupt subs and shifts */
 char _eedata;   /* eedata in access ram */
 char fsr_temp;
-
 /* 9 more locations for access ram */
+char ticks;     /* timer tick in interrupt */
 
 
 
 /* bank 0 ram - 80 locations */
 /* any arrays need to be in page 0 or page 1 as the IRP bit is not updated */
 #pragma pic  32
+char s_porta;      /* shadow ports to avoid rmw issues, in same bank as the ports */
+char s_portb;      /* but watch out if need to set pins in an interrupt */
 
 
 /* bank 1 ram - 80 bytes */
@@ -137,9 +158,7 @@ char sideband;
 
 /* bank 2 ram - no arrays - 96 locations -  */
 #pragma pic 272
-char tune;       /* digit we are tuning */
-char porta;      /* shadow ports to avoid rmw issues */
-char portb;      /* but watch out if need to set pins in an interrupt */
+char tune_digit;       /* digit we are tuning */
 
 /* bank 3 ram - no arrays - 96 locations - function args and statics are also here */
 #pragma pic 400
@@ -153,35 +172,31 @@ char portb;      /* but watch out if need to set pins in an interrupt */
 #pragma shortcall
 
 main(){       /* any page */
+static char t;
+static char encoder_user;
 
-  /* just test the lcd */
-  lcd_goto( 0 );
-  test_font();
-  lcd_goto( 1*16 + 2 );
-  test_font(); test_font();
-  lcd_goto( 2*16 + 4 );
-  test_font(); test_font(); test_font();
-  lcd_goto( 3*16 + 6 );
-  test_font(); test_font(); test_font(); test_font();
-  lcd_goto( 4*16 + 8 );
-  test_font(); test_font(); test_font(); test_font(); test_font();
-  lcd_goto( 5*16 + 10 );
-  test_font(); test_font(); test_font(); test_font(); test_font();
+   encoder_user = FREQ;
 
 for(;;){    /* loop main */
 
+  /* t = encoder(); */
+   if( t = encoder() ){          /* assign wanted */
+      switch( encoder_user ){
+      case FREQ:
+         no_interrupts();
+         if( t == 1 ) inc_freq(tune_digit);   /* recursive, no interrupts because of 8 level stack */
+         else dec_freq(tune_digit);
+         interrupts();
+         vfo_update(NEW+RX);   /* side effect, if sweeping vfo on TX, you return to rx mode */
+         display_freq();
+      break;
+      }
 
+   }  /* end encoder true */
 
 }
 }
 
-test_font(){    /* just a test function */
-static char i;
-
-   lcd_data(0);  /* letter spacing */
-   for( i = 0; i < 5; ++i ) lcd_data( fonts[i] ); 
-
-}
 
 display_freq(){   /* top row, 5 big numbers and 3 small */
 static char i,c;
@@ -192,11 +207,13 @@ static char j,k;
       c = freq[i];
       j = 0;
       while(c--) j += 5;   /* index into the numbers fonts */
-      lcd_data(0);  lcd_data(0);
+      lcd_data(0);
+      lcd_data(0);
       for( k = 0; k < 5; ++k ){
          c = numbers[j++];
          c = top_font(c);
-         lcd_data(c); lcd_data(c);
+         lcd_data(c);
+         lcd_data(c);
       }
    }
 
@@ -205,11 +222,13 @@ static char j,k;
       c = freq[i];
       j = 0;
       while(c--) j += 5;   /* index into the numbers fonts */
-      lcd_data(0);  lcd_data(0);
+      lcd_data(0);
+      lcd_data(0);
       for( k = 0; k < 5; ++k ){
          c = numbers[j++];
          c = bot_font(c);
-         lcd_data(c); lcd_data(c);
+         lcd_data(c);
+         lcd_data(c);
       }
    }
 
@@ -256,43 +275,35 @@ static char r;
     return r;
 }
 
-
-
-spi_send( char data ){   /* waiting for done at end so can keep cs and other control signals active */
-
    #asm
-     banksel PIR1
-     bcf  PIR1,SSPIF      ; read only bit but must be cleared in software ???
-   #endasm
+   ; removing the extra C overhead to speed this function up
 
-   SSPBUF = data;
+spi_send
 
-   #asm
-spi_send2
-     banksel PIR1
-     btfss PIR1,SSPIF
-     goto spi_send2
+   banksel SSPBUF
+   movwf   SSPBUF
+   nop            ; 4us delay
+   nop
+   nop
+   nop
+   return         ; 2 us delay and caller will suffer a banksel before data strobe or releasing CS
+                  ; so fastest would be a 10us delay with 2us safety margin
    #endasm
-}
 
 lcd_command( char data ){
 
-   /* d/c low, call lcd_data, d/c high */
-   portb = portb & ( 0xff ^ LCD_DC );
-   PORTB = PORTB;
-   lcd_data( data );
-   portb = portb | LCD_DC;
-   PORTB = portb;
+   /* d/c low cs low, call spi, d/c and cs high */
+   PORTB = s_portb = s_portb & ( 0xff ^ ( LCD_DC + LCD_CS));
+   spi_send( data );
+   PORTB = s_portb = s_portb | (LCD_DC + LCD_CS) );
 }
 
 lcd_data( char data ){
 
     /* cs low, spi, cs high */
-    portb = portb & ( 0xff ^ LCD_CS );
-    PORTB = portb;
+    PORTB = s_portb = s_portb & ( 0xff ^ LCD_CS );
     spi_send( data );
-    portb = portb | LCD_CS;
-    PORTB = portb;
+    PORTB = s_portb = s_portb | LCD_CS;    /* set up for releasing CS */
 }
 
 lcd_goto( char row_col ){   /* 6 rows, 14 columns in nibbles */
@@ -308,6 +319,23 @@ static char col;
    while( row-- ) col += 6;   /* character based adressing instead of graphic */
    lcd_command( 0x80 + col );
 
+}
+
+clock_dds(){
+   /* data to load is in the accumulator */
+
+   spi_send(bitrev(acc0));    /* lsb bytes and bits first */
+   spi_send(bitrev(acc1));
+   spi_send(bitrev(acc2));
+   spi_send(bitrev(acc3));
+   #asm
+     nop
+     nop
+     nop
+   #endasm
+   spi_send(0);
+
+   /* load pin is toggled elsewhere */
 }
 
 
@@ -525,6 +553,36 @@ calc_dds_base(){   /* add everything up and save it when frequency changes */
    dds_base3 = acc3;
 }
 
+vfo_update( char function ){    /* functions NEW, RX, TX */
+
+   if( function & NEW ) calc_dds_base();
+   else{
+      acc0 = dds_base0;
+      acc1 = dds_base1;
+      acc2 = dds_base2;
+      acc3 = dds_base3;
+   }
+   if( (function & RX) ){
+      if( s_porta & DDS_LD ){    /* we are transmitting, so turn it off */
+         PORTA = s_porta = s_porta & ( 0xff ^ DDS_LD );
+         delay(10);             /* let tx decay on freq, how long should this be? 10ms */
+      }         
+      add_sub_IF();
+   }
+   if( function & TX ) add_sub_offset();   /* 800 hz */
+
+   clock_dds(); 
+  
+   /* set the dds load strobe */
+   PORTA = s_porta = s_porta | DDS_LD;
+
+   if( function & RX ){
+    /* clear the strobe, left high on TX as it also keys the transmitter */
+      PORTA = s_porta = s_porta & ( 0xff ^ DDS_LD );
+   }
+}
+
+
 zacc(){     /* zero the accumulator */
    
    acc3 = acc2 = acc1 = acc0 = 0;
@@ -549,6 +607,32 @@ dec_freq( char i ){    /* must be called from main with ints disabled */
    }
 }
 
+delay( char t ){        /* delay something close to 1ms per count */
+static char time_sink;
+
+   do{
+      time_sink = 198;
+      do{ } while( --time_sink ); 
+   } while( --t );
+}
+
+interrupts(){
+
+   #asm
+      bsf   INTCON,GIE   
+   #endasm
+}
+
+no_interrupts(){
+
+   #asm
+      bcf   INTCON,GIE
+      btfsc INTCON,GIE    ;see AN576
+      goto $-2
+   #endasm
+
+}
+
 #pragma longcall
 
 /* 
@@ -558,6 +642,10 @@ dec_freq( char i ){    /* must be called from main with ints disabled */
      lc_example();    call into another code page
    }
 */
+
+char encoder(){
+   return ( lc_encoder() );
+}
 
 /* end of page 0 program section */
 
@@ -584,30 +672,74 @@ dec_freq( char i ){    /* must be called from main with ints disabled */
 init(){       /* any page, called once from reset */
 
 /* enable clock at 8 meg */
-   OSCCON= 0x72;        /* 8 meg internal clock or 70 */
+   OSCCON= 0x60;   /* 60 is 4 meg internal clock or 70 for 8 meg */
+   EECON1 = 0;     /* does the free bit sometime power up as 1 */
 
 
 /* init variables */
    freq[0] = 1;
-   freq[1] = 0;    /* somewhere in 10 mhz */
+   freq[1] = 0;
    freq[2] = 1;
-   tune = 0;       /* tuning mhz digit */
+   freq[3] = 1;
+   freq[4] = 6;
+   freq[5] = 0;
+   freq[6] = 0;
+   tune_digit = 1;        /* tuning mhz digit for quick qsy */
+   sideband = USB;
 
 /* init pins */
-   portb = PORTB = 0xea;        /* 0b11101010; */
-   TRISB = 0xc2;                /* 0b11000010; */
+   /* reset LCD before setting up SPI */
+   PORTB = 0xfc;                /* 0b11111100 */
+   TRISB = 0xc0;                /* 0b11000000 reset low, bit 1 */
+   delay(10);
+   s_portb = PORTB = 0xfe;        /* 0b11111110; */
+   TRISB = 0xc2;                /* 0b11000010; reset pin will become SDI input */
+                                /*  sw1,sw2,LCD d/c,spi_clk, LCD CS,spi_data,LCD_reset/spi_data_in,PWM_agc */
+                                /*  sw3 is a diode OR of sw1 and sw2. it looks like both sw1 and sw2 were pressed */
+   
+   ANSEL = 0x04;     /* one analog pin RA2 */
+   PORTA = 0;
+   TRISA = 0x3f;     /* 0011 1111 */
+                     /* sidetone, tx-ld strobe,sw4,dit, dah ,audio,encoder b,encoder a */
 
-/* init DDS, clock and load to get into serial mode */
+/* init DDS, clock and load to get into serial mode, twice just in case */
+
+   PORTB = 0xfe - 0x10;     /* clock low */
+   PORTB = 0xfe;         /* clock high */
+   PORTA = DDS_LD;            /* load pulse */
+   PORTA = 0;        
+   PORTB = 0xfe - 0x10;     /* clock low */
+   PORTB = 0xfe;         /* clock high */
+   PORTA = DDS_LD;            /* load pulse */
+   PORTA = 0;        
+
+   PORTB = s_portb = 0xfe;
+   PORTA = s_porta = 0;
 
 /* set up SPI */
-   SSPSTAT = 0;      /* default is zero */
-   SSPCON  = 0x20;   /* enable spi master mode at 2 meg clocks, or 1 meg if at 4 mhz clock */
+   SSPSTAT = 0x00;      /* default is zero, different clock to data timing with CKE 0x40 set? */
+   SSPCON  = 0x30;      /* need clock idle high for correct data timing to clock rising edge */
 
 /* init LCD */
-   lcd_init( 65 );
+   lcd_init( 70 );   /* contrast 65 looks a little light */
 
-/* init PWM */
+/* init PWM , uses timer2*/
 
+/* load the default DDS words */
+   vfo_update(NEW+RX);
+   display_freq();
+
+/* start timer1 interrupts */
+/* start timer */
+   TMR1H = T1HIGH;     /* with 4 meg clock, interrupt at 1ms rate */
+   TMR1L = T1LOW;
+   T1CON = T1ON;
+
+/* enable interrupts */
+   PIE1 = 1;        /* timer 1 interrupt */
+   INTCON = 0xc0;
+
+   lc_encoder();    /* init some of the static vars in encoder read */
 
 }
 
@@ -616,9 +748,18 @@ init(){       /* any page, called once from reset */
 /* any page. Save _temp if using any calls to other functions */
 _interrupt(){  /* status has been saved */
 
+   T1CON= T1OFF:         /* 1 ms timer rate */
+   TMR1H = T1HIGH;  
+   TMR1L += (T1LOW + 6 + 2);   /*  adjust for timer off time */
+   T1CON= T1ON;  
+   ++ticks;              /* count milliseconds */
+
 
 /* restore status */
 #asm
+       banksel    PIR1                       ; clear timer 1 interrupt flag
+       bcf        PIR1,TMR1IF
+
         movf            fsr_temp,w
         movwf           FSR
 	movf		pclath_temp,w		; retrieve copy of PCLATH register
@@ -646,6 +787,32 @@ static char i;
    for( i = 0; i < 200; ++i ) lcd_data( 0 );
    for( i = 0; i < 104; ++i ) lcd_data( 0 );
 
-   lcd_command( 0x8 + 0x4 );         /* display normal */
+   lcd_command( 0x8 + 0x4 );         /* display on normal mode */
 
 }
+
+
+char lc_encoder(){   /* read encoder, return 1, 0, or -1( 255 ) */
+  
+static char mod;     /* encoder is divided by 4 because it has detents */
+static char dir;     /* need same direction as last time, effective debounce */
+static char last;    /* save the previous reading */
+static char new;     /* this reading */
+static char b;
+
+   new = PORTA & 3;  
+   if( new == last ) return 0;       /* no change */
+
+   b = ( (last << 1) ^ new ) & 2 );  /* direction 2 or 0 from xor of last shifted and new data */
+   last = new;
+   if( b != dir ){
+      dir = b;
+      return 0;      /* require two clicks in the same direction */
+   }
+   mod = (mod + 1) & 3;      /* divide clicks by 4 */
+   if( mod != 3 ) return 0;
+
+   if( dir == 2 ) return 1;   /* swap return values if it works backwards */
+   else return 255;
+}
+

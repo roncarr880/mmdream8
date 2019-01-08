@@ -175,7 +175,8 @@ char WPUB   ; /*             EQU  H'0095'    */
 #pragma pic 152
 char TXSTA ; /*              EQU  H'0098'    */
 char SPBRG  ; /*             EQU  H'0099'    */
-#pragma pic 156
+#pragma pic 155
+char ANSEL;
 char CMCON;
 char CVRCON;
 
