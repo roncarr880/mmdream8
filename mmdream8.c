@@ -14,7 +14,7 @@
 
    The dds word calculation uses pre-calculated dds values for each decade and they
    are added to find the total dds word.  From there any offsets needed are added or subtracted.
-   The pre-calculated values are stored as program literals.  A little more code, less ram needed.
+   The pre-calculated values are stored as program literals.  A little more code, less ram/eeprom needed.
 
 */
 
@@ -67,6 +67,22 @@
 #define T1OFF  0
 #define T1LOW   0x18
 #define T1HIGH  0xfc
+  /* switch states */
+#define IDLE 0
+#define ARM  1
+#define DARM 2
+#define DONE 3
+#define TAP  4
+#define DTAP 5
+  /* screen rows ( + 0 to 13 columns in lcd_goto row,col) */
+#define ROW0 0
+#define ROW1 16
+#define ROW2 32
+#define ROW3 48
+#define ROW4 64
+#define ROW5 80
+
+#define CONTRAST 70
 
 
 /* include the SFR's as C chars and the runtime library */
@@ -116,6 +132,7 @@ extern char letters[] = {
  0x61, 0x51, 0x49, 0x45, 0x43
 };                             /* 180 locations used, 76 left */
 
+
 /* access ram  - 16 locations, use wisely */
 #pragma pic 112
 
@@ -136,7 +153,10 @@ char ticks;     /* timer tick in interrupt */
 #pragma pic  32
 char s_porta;      /* shadow ports to avoid rmw issues, in same bank as the ports */
 char s_portb;      /* but watch out if need to set pins in an interrupt */
-
+char sstate[4];    /* state of each switch */
+char sticks;       /* switch timer */
+char press;        /* count of switch pressed time */
+char nopress;      /* count of switch up time */
 
 /* bank 1 ram - 80 bytes */
 /* try using more of bank 1 and see how banksel looks between statics in bank3 */
@@ -150,15 +170,16 @@ char freq[7];   /* frequency in sort of bcd form but one byte for each digit, hz
 char dds_base0,dds_base1,dds_base2,dds_base3;
 
 char acc0,acc1,acc2,acc3;   /* 32 bit working registers */
-char arg0,arg1,arg2,arg3;
-    
+char arg0,arg1,arg2,arg3;    
 char sideband;  
 /* 20 used */
+
+char tune_digit;       /* digit we are tuning */
 
 
 /* bank 2 ram - no arrays - 96 locations -  */
 #pragma pic 272
-char tune_digit;       /* digit we are tuning */
+char encoder_user;
 
 /* bank 3 ram - no arrays - 96 locations - function args and statics are also here */
 #pragma pic 400
@@ -173,17 +194,16 @@ char tune_digit;       /* digit we are tuning */
 
 main(){       /* any page */
 static char t;
-static char encoder_user;
 
    encoder_user = FREQ;
 
 for(;;){    /* loop main */
 
-  /* t = encoder(); */
-   if( t = encoder() ){          /* assign wanted */
+   t = encoder(); 
+   if( t ){                     
       switch( encoder_user ){
       case FREQ:
-         no_interrupts();
+         no_interrupts(); 
          if( t == 1 ) inc_freq(tune_digit);   /* recursive, no interrupts because of 8 level stack */
          else dec_freq(tune_digit);
          interrupts();
@@ -191,33 +211,127 @@ for(;;){    /* loop main */
          display_freq();
       break;
       }
-
    }  /* end encoder true */
 
+   switches();    /* run the switch state code */
+                  /* act on any switch presses */
+   tune_digit_ch();
+   sideband_change();
+   freq_volume();          /* encoder functions */
+   rit_key_speed();        /* encoder functions */ 
+
 }
 }
 
+tune_digit_ch(){
+static char update;
+
+  update = 0;
+  if( sstate[3] < TAP ) return;
+  if( sstate[3] == TAP ){
+     if( ++tune_digit > 6 ) tune_digit = 1;   /* skip 10mhz tuning, 1mhz is quick enough for qsy */
+  }
+  else{    /* it is a double tap */
+     if( --tune_digit == 0 ) tune_digit = 6;
+  }
+
+  if( tune_digit == 5 ) freq[6] = 0 , update = 1;       /* 100hz steps, no tens */
+  if( tune_digit == 4 ){
+     freq[5] = 0;       /* 1 k steps, no 100's or tens */
+     freq[6] = 0;
+     update = 1;
+  }
+  if( update ){
+     vfo_update(NEW+RX);
+     display_freq();
+  }
+
+  status_line();
+  sstate[3] = DONE;
+}
+
+sideband_change(){
+
+   if( sstate[2] < TAP ) return;
+   sideband ^= 1;                /* just toggle tap or dtap */
+                                 /* consider altering freq to keep same 800hz tone unchanged */
+   vfo_update();
+   status_line():
+   sstate[2] = DONE;
+}
+
+freq_volume(){
+
+   if( sstate[1] < TAP ) return;
+
+   sstate[1] = DONE:
+}
+
+rit_key_speed(){
+
+   if( sstate[0] < TAP ) return;
+
+   sstate[0] = DONE;
+}
+
+lcd_putch(char val){    /* write uppercase letters to display */
+static char i;
+
+
+   if( val >= '0' && val <= '9' ){    /* call different function if its a number */
+      lcd_putchn( val );
+      return;
+   }   
+   if( val < 'A' || val > 'Z' ) return;
+   val -= 'A';
+   i = 0;
+   while( val-- ) i += 5;   /* get index to start of the letter */
+   lcd_data(0);
+   for( val = 0; val < 5; ++val ){
+     lcd_data( letters[i++] );
+   }
+}
+
+
+lcd_putchn( char val ){
+static char i;
+
+   val -= '0';
+   i = 0;
+   while( val-- ) i += 5;   /* get index to start of the font */
+   lcd_data(0);
+   for( val = 0; val < 5; ++val ){
+     lcd_data( numbers[i++] );
+   }
+
+}
 
 display_freq(){   /* top row, 5 big numbers and 3 small */
 static char i,c;
 static char j,k;
 
-   lcd_goto(0);   /* print the top part */
+   lcd_goto(ROW0);   /* print the top part */
    for( i = 0; i < 5; ++i ){  /* each decade */
       c = freq[i];
       j = 0;
       while(c--) j += 5;   /* index into the numbers fonts */
+      lcd_data(0);         /* zero space column left out of the fonts to save eeprom space */
       lcd_data(0);
-      lcd_data(0);
-      for( k = 0; k < 5; ++k ){
+      for( k = 0; k < 5; ++k ){   /* 5 real columns of the 6 column font */
          c = numbers[j++];
          c = top_font(c);
-         lcd_data(c);
-         lcd_data(c);
+         if( i == 0 && j < 6 ){   /* blank leading zero */
+            lcd_data(0);
+            lcd_data(0);
+         }
+         else{
+            lcd_data(c);
+            lcd_data(c);
+         }
       }
    }
 
-   lcd_goto(16);   /* print the bottom part, lcd row 1 */
+   lcd_goto(ROW1);   /* print the bottom part, lcd row 1 */
    for( i = 0; i < 5; ++i ){  /* each decade */
       c = freq[i];
       j = 0;
@@ -227,8 +341,14 @@ static char j,k;
       for( k = 0; k < 5; ++k ){
          c = numbers[j++];
          c = bot_font(c);
-         lcd_data(c);
-         lcd_data(c);
+         if( i == 0 && j < 6 ){   /* blank leading zero */
+            lcd_data(0);
+            lcd_data(0);
+         }
+         else{
+            lcd_data(c);
+            lcd_data(c);
+         }
       }
    }
 
@@ -238,13 +358,13 @@ static char j,k;
       c = freq[i];
       j = 0;
       while(c--) j += 5;
-      lcd_data(0);
       for( k = 0; k < 5; ++k ){
          lcd_data( numbers[j++] );
       }
+      lcd_data(0);   /* move characters back one column by printing space at the end */
    }
 
-   lcd_data(0);
+  /* lcd_data(0); */
    for( k = 0; k < 5; ++k ) lcd_data( numbers[k] );   /* print last digit as a zero */ 
   
 
@@ -274,6 +394,27 @@ static char r;
     if( c & 128 ) r+= 0xc0;
     return r;
 }
+
+
+status_line(){   /* print on line 3 */
+static char i;
+static char j;
+static char f;
+
+   lcd_goto(ROW2);
+   for( i = 0; i < 5; ++i ){
+      f = ( i == tune_digit ) ? 0x83:0x80;
+      lcd_data(0x80);
+      lcd_data(0x80);
+      for( j = 2; j < 12; ++j ) lcd_data( f );
+   }
+   for( j = 0; j < 3; ++j ) lcd_data(0);
+   if( sideband == USB ) lcd_putch( 'U' );
+   else lcd_putch( 'L' );
+   lcd_putch( 'S' );
+   lcd_putch( 'B' );
+}
+
 
    #asm
    ; removing the extra C overhead to speed this function up
@@ -367,44 +508,33 @@ char bitrev( char data ){    /* reverse the bits in a byte */
 
 char dadd(){    /* 32 bit add */
 
-   #asm
-  ;   bcf     STATUS,C   not needed as the add will set or clear the bit
+#asm 
+     banksel arg0
      movf    arg0,W
      addwf   acc0,F
-     clrw
-     btfsc   STATUS,C   ; propagate carry to the 3 upper bytes
-     movlw    1
+     movlw   1
+     btfsc   STATUS,C
      addwf   acc1,F
-     clrw
      btfsc   STATUS,C
-     movlw   1
      addwf   acc2,F
-     clrw
      btfsc   STATUS,C
-     movlw   1
      addwf   acc3,F
 
-  ;   bcf     STATUS,C
+
      movf    arg1,W
      addwf   acc1,F
-     clrw
-     btfsc   STATUS,C
      movlw   1
+     btfsc   STATUS,C
      addwf   acc2,F
-     clrw
      btfsc   STATUS,C
-     movlw   1
      addwf   acc3,F
 
-  ;   bcf     STATUS,C
      movf    arg2,W
      addwf   acc2,F
-     clrw
-     btfsc   STATUS,C
      movlw   1
+     btfsc   STATUS,C
      addwf   acc3,F
 
-  ;   bcf     STATUS,C
      movf    arg3,W
      addwf   acc2,F
      
@@ -415,43 +545,32 @@ char dadd(){    /* 32 bit add */
 char dsub(){    /* 32 bit sub */
 
    #asm
-   ;  bcf     STATUS,C  must be holdover from 6502 coding
+
+     banksel arg0
      movf    arg0,W
      subwf   acc0,F     ; borrow is carry 0
-     clrw
+     movlw   1
      btfss   STATUS,C   ; propagate borrow to the 3 upper bytes
-     movlw    1
      subwf   acc1,F
-     clrw
      btfss   STATUS,C
-     movlw   1
      subwf   acc2,F
-     clrw
      btfss   STATUS,C
-     movlw   1
      subwf   acc3,F
 
-  ;   bcf     STATUS,C   ; 
      movf    arg1,W
      subwf   acc1,F
-     clrw
-     btfss   STATUS,C
      movlw   1
+     btfss   STATUS,C
      subwf   acc2,F
-     clrw
      btfss   STATUS,C
-     movlw   1
      subwf   acc3,F
 
-  ;   bcf     STATUS,C
      movf    arg2,W
      subwf   acc2,F
-     clrw
-     btfss   STATUS,C
      movlw   1
+     btfss   STATUS,C
      subwf   acc3,F
 
-  ;   bcf     STATUS,C
      movf    arg3,W
      subwf   acc2,F
      
@@ -591,8 +710,9 @@ zacc(){     /* zero the accumulator */
 
 inc_freq( char i ){    /* increment the frequency array by step size, try recursion for carry */
                        /* only 8 stack levels, must be called from main with ints disabled */
+   if( i > 6 ) return;
    freq[i] += 1;
-   if( freq[i] == 10 && i != 0 ){
+   if( freq[i] == 10 ){
       freq[i] = 0;
       inc_freq( i-1 );
    }
@@ -600,8 +720,9 @@ inc_freq( char i ){    /* increment the frequency array by step size, try recurs
 
 dec_freq( char i ){    /* must be called from main with ints disabled */
 
+   if( i > 6 ) return;
    freq[i] -= 1;
-   if( freq[i] == 255 && i != 0 ){
+   if( freq[i] == 255 ){
       freq[i] = 9;
       dec_freq(i-1);
    }
@@ -647,6 +768,10 @@ char encoder(){
    return ( lc_encoder() );
 }
 
+switches(){         /* use some page 2 program memory */
+   lc_switches();
+}
+
 /* end of page 0 program section */
 
 
@@ -670,8 +795,9 @@ char encoder(){
 */
 
 init(){       /* any page, called once from reset */
+static char i;
 
-/* enable clock at 8 meg */
+/* enable clock at 4 or 8 meg */
    OSCCON= 0x60;   /* 60 is 4 meg internal clock or 70 for 8 meg */
    EECON1 = 0;     /* does the free bit sometime power up as 1 */
 
@@ -686,6 +812,9 @@ init(){       /* any page, called once from reset */
    freq[6] = 0;
    tune_digit = 1;        /* tuning mhz digit for quick qsy */
    sideband = USB;
+   for( i = 0; i < 4; ++i ) sstate[i] = 0;
+   sticks = ticks;
+   press = nopress = 0;
 
 /* init pins */
    /* reset LCD before setting up SPI */
@@ -693,7 +822,7 @@ init(){       /* any page, called once from reset */
    TRISB = 0xc0;                /* 0b11000000 reset low, bit 1 */
    delay(10);
    s_portb = PORTB = 0xfe;        /* 0b11111110; */
-   TRISB = 0xc2;                /* 0b11000010; reset pin will become SDI input */
+   TRISB = 0xc2;                /* 0b11000010; reset pin will become unused SDI input ( with pullup resistor ) */
                                 /*  sw1,sw2,LCD d/c,spi_clk, LCD CS,spi_data,LCD_reset/spi_data_in,PWM_agc */
                                 /*  sw3 is a diode OR of sw1 and sw2. it looks like both sw1 and sw2 were pressed */
    
@@ -721,13 +850,14 @@ init(){       /* any page, called once from reset */
    SSPCON  = 0x30;      /* need clock idle high for correct data timing to clock rising edge */
 
 /* init LCD */
-   lcd_init( 70 );   /* contrast 65 looks a little light */
+   lcd_init(); 
 
 /* init PWM , uses timer2*/
 
 /* load the default DDS words */
    vfo_update(NEW+RX);
    display_freq();
+   status_line();
 
 /* start timer1 interrupts */
 /* start timer */
@@ -735,9 +865,9 @@ init(){       /* any page, called once from reset */
    TMR1L = T1LOW;
    T1CON = T1ON;
 
-/* enable interrupts */
-   PIE1 = 1;        /* timer 1 interrupt */
-   INTCON = 0xc0;
+/*  enable interrupts */
+   PIE1 = 1;       /* timer 1 interrupt */
+   INTCON = 0xc0; 
 
    lc_encoder();    /* init some of the static vars in encoder read */
 
@@ -756,6 +886,7 @@ _interrupt(){  /* status has been saved */
 
 
 /* restore status */
+
 #asm
        banksel    PIR1                       ; clear timer 1 interrupt flag
        bcf        PIR1,TMR1IF
@@ -772,12 +903,11 @@ _interrupt(){  /* status has been saved */
 }
 
 
-lcd_init( char contrast ){
+lcd_init( ){
 static char i;
-    /* reset pulse from  ? */
    
    lcd_command( 0x21 );              /* extended mode */
-   lcd_command( 0x80 + contrast );   /* v op */
+   lcd_command( 0x80 + CONTRAST );   /* v op */
    lcd_command( 6 );                 /* temp comp */
    lcd_command( 0x13 );              /* bias */
    lcd_command( 0x20 );              /* out of extended mode */
@@ -812,7 +942,41 @@ static char b;
    mod = (mod + 1) & 3;      /* divide clicks by 4 */
    if( mod != 3 ) return 0;
 
-   if( dir == 2 ) return 1;   /* swap return values if it works backwards */
-   else return 255;
+   if( dir == 2 ) return 255;   /* swap return values if it works backwards */
+   else return 1;
 }
 
+
+lc_switches(){       /* run the switch state machine */
+static char i,j;
+static char sw;
+static char s;
+
+   if( sticks == ticks ) return;   /* not time yet */
+   ++sticks;
+   
+   /* get the switch readings, low active but invert bits */
+   sw = ((PORTB & 0xc0) >> 4) ^ 0x0c;                 
+   if( sw == 0x0c ) sw = 2;     /* virtual switch 3, via diodes OR */
+   /* !!! if( (PORTA & 0x20) == 0 ) sw |= 1; */  /* last switch is on mclr pin */
+
+   if( sw ) ++press, nopress = 0;       /* only acting on one switch at a time */
+   else ++nopress, press = 0;           /* so these simple vars work for all of them */
+
+   /* run the state machine for the 4 switches in a loop */
+   for( i = 0, j = 1; i < 4; ++i ){
+      s = sstate[i];
+      switch(s){
+         case DONE:  if( nopress >= 100 ) s = IDLE;  break;
+         case IDLE:  if( ( j & sw ) && press >= 30 ) s = ARM;  break; /* pressed */
+         case ARM:   if( nopress >= 30 ) s = DARM; break;             /* it will be a tap or double tap */
+         case DARM:
+            if( nopress >= 240 ) s = TAP;
+            if( press >= 30 )    s = DTAP;
+         break;
+      }      
+      sstate[i] = s; 
+      j <<= 1;
+   }
+
+}
